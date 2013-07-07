@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <netdb.h>
 
 #include "const-c.inc"
 
@@ -303,6 +304,161 @@ list_rules_IPs(self, type, chain)
 	    XSRETURN_UNDEF;
 	}
     }
+
+SV *
+list_rules(self, chain)
+    IPTables::libiptc self
+    ipt_chainlabel    chain
+  INIT:
+    AV * results;
+    AV * matches;
+    int    count = 0;
+    int    i;
+    struct ipt_entry *entry;
+    struct protoent *pent;
+    char   buf[100]; /* I should be enough with only 32 chars */
+    static char * errmsg = "Something vague has gone wrong.";
+    struct ipt_entry_target *t;
+    results = (AV *)sv_2mortal((SV *)newAV());
+    matches = (AV *)sv_2mortal((SV *)newAV());
+  CODE:
+    if (*self == NULL) croak(ERRSTR_NULL_HANDLE);
+    else {
+        if(iptc_is_chain(chain, *self)) {
+            entry = (struct ipt_entry *)iptc_first_rule(chain, self);
+
+            while(entry) {
+                count++;
+                if (GIMME_V == G_ARRAY) {
+                    HV * rh;
+                    rh = (HV *)sv_2mortal((SV *)newHV());
+
+                    //Source -- TODO check for inversion
+                    sprintf(buf,"%s%s",(char*)addr_to_dotted(&(entry->ip.src)),
+                                       (char*)mask_to_dotted(&(entry->ip.smsk)));
+                    hv_store(rh, "src", 3, newSVpv(buf, 0), 0);
+
+                    //Destination -- TODO check for inversion
+                    sprintf(buf,"%s%s",(char*)addr_to_dotted(&(entry->ip.dst)),
+                                       (char*)mask_to_dotted(&(entry->ip.dmsk)));
+                    hv_store(rh, "dst", 3, newSVpv(buf, 0), 0);
+
+                    //Input interface -- TODO check for inversion
+                    //Taken verabatim from iptables-save.c
+                    sprintf(buf, "");
+                    for (i = 0; i < IFNAMSIZ; i++) {
+                        if (entry->ip.iniface_mask[i] != 0) {
+                            if (entry->ip.iniface[i] != '\0') {
+                                snprintf(buf + strlen(buf), 100, "%c", entry->ip.iniface[i]);
+                            }
+                        } else {
+                            /* we can access iface[i-1] here, because
+                             * a few lines above we make sure that mask[0] != 0 */
+                            if (entry->ip.iniface[i-1] != '\0')
+                                strcat(buf, "+");
+                            break;
+                        }
+                    }
+                    hv_store(rh, "iniface", 7, newSVpv(buf, 0), 0);
+
+                    //Input interface -- TODO check for inversion
+                    //Adapted from iptables-save.c
+                    sprintf(buf, "");
+                    for (i = 0; i < IFNAMSIZ; i++) {
+                        if (entry->ip.outiface_mask[i] != 0) {
+                            if (entry->ip.outiface[i] != '\0')
+                                snprintf(buf + strlen(buf), 100 - strlen(buf), "%c", entry->ip.outiface[i]);
+                        } else {
+                            /* we can access iface[i-1] here, because
+                             * a few lines above we make sure that mask[0] != 0 */
+                            if (entry->ip.outiface[i-1] != '\0')
+                                strcat(buf, "+");
+                            break;
+                        }
+                    }
+                    hv_store(rh, "outiface", 8, newSVpv(buf, 0), 0);
+
+                    //Protocol -- TODO check for inverstion
+                    //Adapted from iptables-save.
+                    if (entry->ip.proto) {
+                        //iptables-save.c incuded a fall back to use a static table.
+                        //I've left that out here at my own peril
+                        pent = (struct protoent *)getprotobynumber(entry->ip.proto);
+                        if (pent)
+                            snprintf(buf, 100, "%s", pent->p_name);
+                        else
+                            snprintf(buf, 100, "%u", entry->ip.proto);
+                    }
+                    hv_store(rh, "proto", 5, newSVpv(buf, 0), 0);
+
+                    //Fragments?
+                    sprintf(buf, "0");
+                    if (entry->ip.flags & IPT_F_FRAG)
+			sprintf(buf, "1");
+                    hv_store(rh, "fragments_only", 14, newSVpv(buf, 0), 0);
+
+                    //Module fun
+                    //So, uhhh, my C skills aren't ready for this. print_match
+                    //calls the print (ideally it'd be the save) function
+                    //provided by each module. Sadly, that does printf directly
+                    //and I have no idea how to capture it TODO
+//                    sprintf(buf,"");
+//                    if (entry->target_offset) {
+//                        IPT_MATCH_ITERATE(entry, print_match, &entry->ip, matches);
+//                    }
+
+                    //Target
+                    snprintf( buf, 100, "%s", iptc_get_target(entry, self));
+                    if (buf && (*buf != '\0'))
+#ifdef IPT_F_GOTO
+                        snprintf( buf + strlen(buf), 100 - strlen(buf), "%s", entry->ip.flags & IPT_F_GOTO ? " (goto)" : " (jump)");
+#else
+                        snprintf( buf + strlen(buf), 100 - strlen(buf), "%s", " (jump)");
+#endif
+                    hv_store(rh, "target", 6, newSVpv(buf, 0), 0);
+
+                    //Additional target information
+                    //Same problem as module fun above
+                    t = ipt_get_target((struct ipt_entry *)entry);
+                    if (t->u.user.name[0]) {
+                        struct iptables_target *target
+                          = find_target(t->u.user.name, TRY_LOAD);
+
+                        if (!target) {
+                            fprintf(stderr, "Can't find library for target `%s'\n",
+                                    t->u.user.name);
+                            exit(1);
+                        }
+
+                        if (0 && target->save)
+                            target->save(&entry->ip, t);
+                        else {
+                            /* If the target size is greater than ipt_entry_target
+                            * there is something to be saved, we just don't know
+                            * how to print it */
+                            if (t->u.target_size !=
+                                sizeof(struct ipt_entry_target)) {
+                                fprintf(stderr, "Target `%s' is missing "
+                                                "save function\n",
+                                        t->u.user.name);
+                                exit(1);
+                            }
+                        }
+                    }
+
+                    av_push(results, newRV((SV *)rh));
+                }
+                entry = (struct ipt_entry *)iptc_next_rule(entry, self);
+            }
+//S            if (GIMME_V == G_SCALAR)
+//S                XPUSHs(sv_2mortal(newSViv(count)));
+        } else {
+//S            XSRETURN_UNDEF;
+        }
+	RETVAL = newRV((SV *)results);
+    }
+  OUTPUT:
+    RETVAL
 
 
 ##########################################
